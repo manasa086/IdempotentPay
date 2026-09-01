@@ -1,0 +1,13 @@
+# Binaries
+/bin/
+/idempotentpay
+*.exe
+
+# Test / coverage output
+*.out
+coverage.*
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/

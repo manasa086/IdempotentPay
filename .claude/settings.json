@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_screenshot",
+      "mcp__Claude_Browser__read_page",
+      "mcp__Claude_Preview__preview_snapshot",
+      "Bash(go vet *)",
+      "Bash(litmus status *)",
+      "Bash(gh:*)",
+      "Bash(git push:*)",
+      "Bash(git remote add:*)",
+      "Bash(git remote set-url:*)"
+    ]
+  }
+}
