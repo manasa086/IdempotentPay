@@ -3,21 +3,22 @@ package payment
 import (
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 )
 
 // Handler exposes the payment API over HTTP.
 type Handler struct {
-	ledger *Ledger
+	ledger Ledger
 }
 
 // NewHandler returns a Handler backed by ledger.
-func NewHandler(ledger *Ledger) *Handler {
+func NewHandler(ledger Ledger) *Handler {
 	return &Handler{ledger: ledger}
 }
 
 // Routes registers the payment endpoints on mux. The caller is expected to wrap
-// mux with the idempotency middleware.
+// mux with an idempotency middleware.
 func (h *Handler) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/charges", h.CreateCharge)
 	mux.HandleFunc("GET /v1/charges/{id}", h.GetCharge)
@@ -29,6 +30,10 @@ type createChargeRequest struct {
 	Currency    string `json:"currency"`
 }
 
+func (req createChargeRequest) valid() bool {
+	return req.Account != "" && req.AmountCents > 0 && len(req.Currency) == 3
+}
+
 // CreateCharge records a new charge. This is the side-effecting endpoint the
 // idempotency layer protects.
 func (h *Handler) CreateCharge(w http.ResponseWriter, r *http.Request) {
@@ -37,12 +42,18 @@ func (h *Handler) CreateCharge(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "request body must be valid JSON")
 		return
 	}
-
-	c, err := h.ledger.Charge(req.Account, req.AmountCents, req.Currency)
-	if errors.Is(err, ErrInvalidCharge) {
+	if !req.valid() {
 		writeError(w, http.StatusUnprocessableEntity, "account, positive amount_cents, and 3-letter currency are required")
 		return
-	} else if err != nil {
+	}
+
+	c, err := h.ledger.CreateCharge(r.Context(), Charge{
+		Account:     req.Account,
+		AmountCents: req.AmountCents,
+		Currency:    req.Currency,
+	})
+	if err != nil {
+		log.Printf("create charge: %v", err)
 		writeError(w, http.StatusInternalServerError, "could not record charge")
 		return
 	}
@@ -53,9 +64,13 @@ func (h *Handler) CreateCharge(w http.ResponseWriter, r *http.Request) {
 // GetCharge returns a previously recorded charge. It is a safe method and is not
 // guarded by the idempotency layer.
 func (h *Handler) GetCharge(w http.ResponseWriter, r *http.Request) {
-	c, ok := h.ledger.Get(r.PathValue("id"))
-	if !ok {
+	c, err := h.ledger.GetCharge(r.Context(), r.PathValue("id"))
+	if errors.Is(err, ErrNotFound) {
 		writeError(w, http.StatusNotFound, "no such charge")
+		return
+	} else if err != nil {
+		log.Printf("get charge: %v", err)
+		writeError(w, http.StatusInternalServerError, "could not load charge")
 		return
 	}
 	writeJSON(w, http.StatusOK, c)

@@ -1,10 +1,11 @@
 // Package payment is a small demo REST API for a payment service. Its only
 // purpose is to give the idempotency layer a handler with a real, observable
-// side effect: every successful charge mutates an in-memory ledger and bumps a
-// counter that tests assert against to prove exactly-once execution.
+// side effect: every successful charge is written to a ledger, and tests count
+// the recorded charges to prove exactly-once execution.
 package payment
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -21,61 +22,56 @@ type Charge struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// Ledger is a goroutine-safe in-memory record of charges.
-type Ledger struct {
-	mu        sync.Mutex
-	byID      map[string]Charge
-	order     []string
-	processed int64
-	clock     func() time.Time
+// ErrNotFound is returned when a charge does not exist.
+var ErrNotFound = errors.New("charge not found")
+
+// Ledger records charges. Implementations must be safe for concurrent use.
+type Ledger interface {
+	// CreateCharge records c (ID and CreatedAt are assigned) and returns it.
+	// Each successful call is one side effect.
+	CreateCharge(ctx context.Context, c Charge) (Charge, error)
+	// GetCharge returns the charge with the given id, or ErrNotFound.
+	GetCharge(ctx context.Context, id string) (Charge, error)
 }
 
-// NewLedger returns an empty Ledger.
-func NewLedger() *Ledger {
-	return &Ledger{byID: make(map[string]Charge), clock: time.Now}
+// MemoryLedger is an in-memory Ledger for running the demo without a database.
+type MemoryLedger struct {
+	mu    sync.Mutex
+	byID  map[string]Charge
+	clock func() time.Time
 }
 
-// ErrInvalidCharge is returned for a charge request that fails validation.
-var ErrInvalidCharge = errors.New("invalid charge")
+// NewMemoryLedger returns an empty MemoryLedger.
+func NewMemoryLedger() *MemoryLedger {
+	return &MemoryLedger{byID: make(map[string]Charge), clock: time.Now}
+}
 
-// Charge validates and records a new charge. Each call that returns nil error is
-// one side effect: it appends to the ledger and increments the processed
-// counter. The idempotency layer must ensure this runs at most once per key.
-func (l *Ledger) Charge(account string, amountCents int64, currency string) (Charge, error) {
-	if account == "" || amountCents <= 0 || len(currency) != 3 {
-		return Charge{}, ErrInvalidCharge
-	}
-
+// CreateCharge implements Ledger.
+func (l *MemoryLedger) CreateCharge(_ context.Context, c Charge) (Charge, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	c := Charge{
-		ID:          newID(),
-		Account:     account,
-		AmountCents: amountCents,
-		Currency:    currency,
-		CreatedAt:   l.clock(),
-	}
+	c.ID = newID()
+	c.CreatedAt = l.clock()
 	l.byID[c.ID] = c
-	l.order = append(l.order, c.ID)
-	l.processed++
 	return c, nil
 }
 
-// Get returns the charge with the given id.
-func (l *Ledger) Get(id string) (Charge, bool) {
+// GetCharge implements Ledger.
+func (l *MemoryLedger) GetCharge(_ context.Context, id string) (Charge, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	c, ok := l.byID[id]
-	return c, ok
+	if !ok {
+		return Charge{}, ErrNotFound
+	}
+	return c, nil
 }
 
-// Processed reports how many charges have been recorded. Tests use this to
-// verify that N concurrent duplicate requests produced exactly one charge.
-func (l *Ledger) Processed() int64 {
+// Count reports how many charges have been recorded.
+func (l *MemoryLedger) Count(context.Context) (int64, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.processed
+	return int64(len(l.byID)), nil
 }
 
 func newID() string {

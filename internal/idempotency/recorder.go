@@ -62,3 +62,11 @@ func writeResponse(w http.ResponseWriter, res *response, replayed bool) {
 	w.WriteHeader(res.status)
 	_, _ = w.Write(res.body)
 }
+
+// errorResponse builds the same plain-text error response http.Error would write.
+func errorResponse(status int, msg string) *response {
+	h := http.Header{}
+	h.Set("Content-Type", "text/plain; charset=utf-8")
+	h.Set("X-Content-Type-Options", "nosniff")
+	return &response{status: status, header: h, body: []byte(msg + "\n")}
+}

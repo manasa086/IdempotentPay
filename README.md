@@ -1,75 +1,115 @@
 # IdempotentPay
 
-A concurrency-safe **idempotency layer** for REST APIs that perform side effects
-(charges, transfers, order creation), written in Go with the standard library
-only.
+A concurrency-safe, crash-safe **idempotency layer** for REST APIs that move
+money, written in Go and backed by PostgreSQL.
 
-It gives two guarantees for any request carrying an `Idempotency-Key` header:
+For any request carrying an `Idempotency-Key` header it guarantees:
 
-1. **Deduplication** — once a key has been processed, later requests with the
+1. **Exactly-once side effects, even across crashes.** The key, the charge, and
+   the stored response are committed in **one PostgreSQL transaction**. A crash
+   before commit leaves nothing behind; a crash after commit leaves a stored
+   response that the client's retry replays. Either way the customer is charged
+   once.
+2. **Deduplication.** Once a key has been processed, later requests with the
    same key replay the stored response instead of re-running the handler.
-2. **Request coalescing** — while the first ("leader") request for a key is
-   still in flight, concurrent duplicates block on that single execution rather
-   than racing into the handler independently. The side effect therefore runs
-   **exactly once per key**, even under a burst of simultaneous retries.
-
-```
-                       ┌─────────────────────────── Idempotency-Key: "abc" ───┐
- client (retry storm)  │  req₁  req₂  req₃ ... req₂₀₀                          │
-                       └───┬─────┬─────┬──────────┬──────────────────────────-─┘
-                           ▼     ▼     ▼          ▼
-                     ┌──────────────────────────────────┐
-                     │  idempotency.Middleware          │
-                     │  ── begin("abc", fingerprint) ── │
-                     │   leader → runs handler once     │      followers block
-                     │   followers → wait on <-done ────┼────► on the leader's
-                     │   done → replay cached response  │      single execution
-                     └───────────────┬──────────────────┘
-                                     ▼  (exactly one call)
-                            payment handler → ledger  (1 charge recorded)
-```
+3. **Request coalescing.** While the first ("leader") request for a key is in
+   flight, concurrent duplicates wait for that single execution instead of
+   racing into the handler: in-process on a shared channel, and across server
+   instances on PostgreSQL's row lock for the key.
 
 ## Why it exists
 
-Payment clients retry aggressively — on timeout, on connection reset, on a 5xx.
-Without an idempotency layer, three retries of "charge $12.99" can become three
-charges. The usual fix (dedupe on a stored key) still has a race: if two retries
-arrive *while the first is mid-flight*, a naive check-then-insert lets both
-through. IdempotentPay closes that window by making duplicates **wait on the
-in-flight execution** and share its result.
+Payment clients retry aggressively: on timeouts, connection resets, and 5xx
+responses. Without an idempotency layer, three retries of "charge $12.99" become
+three charges. A simple "look up the key, then charge" check has two gaps:
+
+- **The in-flight race.** Two retries arriving while the first is still running
+  both see "no key yet" and both charge.
+- **The crash window.** If the server charges, then crashes before recording the
+  key (or before replying), the retry charges again. The client can't tell
+  "crashed before charging" from "crashed after charging", so it has to retry.
+
+IdempotentPay closes the first gap with request coalescing and the second by
+making the key and the charge a single atomic write.
+
+## How a request flows (PostgreSQL store)
+
+```
+POST /v1/charges   Idempotency-Key: abc
+        │
+        ▼
+ ┌─ in-process flight for "abc"? ──── yes ──► wait on leader's channel ──► replay its result
+ │      no (this request is the leader)
+ ▼
+BEGIN
+  INSERT INTO idempotency_keys (key, request_hash) ... ON CONFLICT DO NOTHING
+     │   (if another instance holds an uncommitted row for "abc", this blocks
+     │    until that transaction commits or rolls back)
+     ├── 0 rows: key already committed ──► SELECT stored response ──► replay it
+     │                                      (different payload ──► 422)
+     └── 1 row: we own the key
+          run the handler with the transaction in its context
+            └── INSERT INTO charges ...            ◄── same transaction
+          handler returned 5xx or panicked ──► ROLLBACK (charge and key both vanish)
+          UPDATE idempotency_keys SET response_status, response_header, response_body
+COMMIT                                             ◄── key + charge + response, atomically
+        │
+        ▼
+write the response to the client
+```
+
+| Crash point | What PostgreSQL holds | What the client's retry gets |
+| --- | --- | --- |
+| Before `COMMIT` | nothing (transaction rolled back when the connection dropped) | a fresh execution, exactly one charge |
+| After `COMMIT`, before the reply | key + charge + stored response | a replay of the original response, no new charge |
+
+Both rows of this table are verified by tests that kill a real server process
+at that point (see [Tests](#tests)).
 
 ## Design
 
 | Concern | Approach |
 | --- | --- |
-| Shared state | Single in-memory map guarded by one `sync.Mutex` (`internal/idempotency/store.go`). |
-| Coalescing | Each key gets an `entry` with a `done` channel. The leader closes it after executing; followers `select` on `<-entry.done` (or their own request context). Closing the channel publishes the cached result with a happens-before edge — no lock needed on the read path. |
-| Leader election | `store.begin(key, hash)` returns exactly one `outcomeLeader` per key under concurrent callers; everyone else is `outcomeFollower` or `outcomeConflict`. |
-| Key reuse with a different payload | Request is fingerprinted (`sha256` of method + path + key + body). A mismatch returns **422 Unprocessable Entity**. |
-| Transient failures | A `5xx` response or a handler **panic** releases the key (`store.abort`) instead of caching it, so retries can re-execute. In-flight followers get a retryable **502**. |
-| Client disconnect | If the leader's request context is cancelled mid-flight, the partial response is not cached. |
-| Memory | Optional TTL: completed entries expire `ttl` after creation, swept by a background janitor; expiry is also checked lazily in `begin` so correctness never depends on the sweep. In-flight entries are never evicted. |
-| Response capture | A buffering `http.ResponseWriter` records status + headers + body. Guarded responses are not streamed incrementally — fine for the create-style endpoints idempotency keys protect. |
+| Atomicity | `PostgresMiddleware` opens the transaction and passes it to the handler through the request context (`db.WithTx`). The ledger writes with `db.Conn(ctx, pool)`, which joins that transaction. |
+| Cross-instance coalescing | The leader's `INSERT` of the key holds the primary-key lock until it commits. A duplicate `INSERT` on another instance blocks on it, then either sees the committed row (replay) or, after a rollback, becomes the new leader. |
+| In-process coalescing | A `flightGroup` (map + mutex + per-key `done` channel) makes duplicates in the same process wait on the leader without each holding a database connection. Closing the channel publishes the result with a happens-before edge, so no lock is needed to read it. |
+| Key reuse with a different payload | Requests are fingerprinted (`sha256` of method + path + key + body). A mismatch returns **422**. |
+| Server errors and panics | Rolled back, not stored: the side effect is undone with the key, so a retry re-executes safely. Waiting duplicates get a retryable **502**. Definitive 4xx responses are stored and replayed. |
+| Client disconnect | A leader runs on a context detached from its client (`context.WithoutCancel`, bounded by a 30s timeout), so a disconnect doesn't abort work that duplicates are waiting on. The client's retry replays the committed result. |
+| Scope | The guarantee covers side effects written to PostgreSQL inside the transaction. A call to an external processor would also need the key passed downstream. The transaction is held open while the handler runs, which suits short database-bound handlers. |
 
-### What's in the box
+An **in-memory store** (`idempotency.Middleware`) with the same deduplication
+and coalescing is included for running without a database. It is single-process
+and doesn't survive restarts; it expires keys with a TTL.
+
+### Layout
 
 ```
-cmd/server/            demo payment API wired behind the middleware
-internal/idempotency/   the reusable layer
-  store.go              mutex-guarded entry store, leader election, TTL
-  middleware.go         net/http middleware: fingerprinting, coalescing, error policy
-  recorder.go           buffering ResponseWriter + cached-response replay
-internal/payment/       side-effecting handler used to prove exactly-once
-  ledger.go             in-memory charge ledger with a Processed() counter
-  handler.go            POST /v1/charges, GET /v1/charges/{id}
+cmd/server/              demo payment API; -store=memory|postgres; crash failpoint for tests
+internal/idempotency/
+  postgres.go            PostgresMiddleware: transactional key reservation, replay, rollback policy
+  flight.go              in-process coalescing for the Postgres middleware
+  middleware.go          in-memory Middleware
+  store.go               in-memory mutex-guarded store with leader election and TTL
+  config.go              options, request fingerprinting, body limits
+  recorder.go            buffering ResponseWriter and response replay
+internal/payment/        POST /v1/charges, GET /v1/charges/{id}; memory and Postgres ledgers
+internal/db/             pool, schema, transaction-in-context helpers; dbtest gives each test its own schema
 ```
 
 ## Run it
 
+With PostgreSQL:
+
 ```bash
-go run ./cmd/server            # listens on :8080
-# or
-make run
+createdb idempotentpay
+go run ./cmd/server -store=postgres -database-url "postgres://localhost:5432/idempotentpay?sslmode=disable"
+```
+
+The server creates its tables on startup. Or run without a database:
+
+```bash
+go run ./cmd/server            # -store=memory, listens on :8080
 ```
 
 ```bash
@@ -96,43 +136,52 @@ curl -s -X POST localhost:8080/v1/charges -d '{}'
 # → 400 Bad Request
 ```
 
-Flags: `-addr` (default `:8080`), `-idempotency-ttl` (default `24h`, `0` = keep forever).
+Flags: `-addr` (default `:8080`), `-store` (`memory` or `postgres`),
+`-database-url` (default `$DATABASE_URL`), `-idempotency-ttl` (memory store only).
 
 ## Using the layer in your own service
 
 ```go
-store := idempotency.NewStore(24 * time.Hour)
-defer store.Close()
+pool, _ := db.Open(ctx, databaseURL)
+_ = db.Migrate(ctx, pool)
 
 mux := http.NewServeMux()
-// ... register handlers ...
+mux.HandleFunc("POST /v1/charges", func(w http.ResponseWriter, r *http.Request) {
+    // Joins the idempotency transaction, so this commits with the key.
+    db.Conn(r.Context(), pool).Exec(r.Context(), `INSERT INTO charges ...`)
+    // ...
+})
 
-idem := idempotency.New(store,
-    idempotency.GuardMethods(http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete),
-    idempotency.RequireKey(true),
-    idempotency.MaxBodyBytes(1<<20),
-)
-http.ListenAndServe(":8080", idem.Handler(mux))
+http.ListenAndServe(":8080", idempotency.NewPostgres(pool).Handler(mux))
 ```
 
 ## Tests
 
-The concurrency guarantees are the point, so they're tested directly:
+The guarantees are the point, so they're tested directly, under Go's race
+detector, against a real PostgreSQL server:
 
 | Test | Asserts |
 | --- | --- |
-| `TestConcurrentDuplicatesExecuteExactlyOnce` | 250 goroutines, one key, ~25ms handler → handler runs **once**, all 250 get the same 201 body |
-| `TestChargeIsProcessedExactlyOnceUnderConcurrentDuplicates` | 200 concurrent `POST /v1/charges`, one key → ledger records **1** charge, every response carries the same charge id |
-| `TestStoreBeginIsSingleLeaderUnderRace` | 500 goroutines call `begin` on one key → exactly **1** elected leader |
-| `TestConcurrentDistinctKeysEachExecuteOnce` | 100 goroutines, 100 keys → 100 executions |
-| `TestServerErrorIsNotCached` | a 500 is not memoized; the retry re-executes |
-| `TestPanicReleasesKeyAndWakesFollowers` | leader panic → followers get 502, key freed, next request succeeds |
-| `TestSameKeyDifferentPayloadIsConflict` | key reuse with a new body → 422 |
-| `TestStoreExpiryPromotesNextCallerToLeader` | after TTL, the key is processed fresh |
+| `TestCrashBeforeCommitLeavesNoCharge` | Starts the real server binary, kills it after the charge is written but before commit, restarts it and retries → **0** charges after the crash, exactly **1** after the retry |
+| `TestCrashAfterCommitReplaysOnRetry` | Kills the server after commit but before it replies, restarts and retries → the retry **replays** the original charge, still exactly **1** |
+| `TestChargeIsProcessedExactlyOnceUnderConcurrentDuplicates` | 250 simultaneous `POST /v1/charges` with one key, against both the Postgres and in-memory stores → exactly **1** charge, every response carries the same charge id |
+| `TestPostgresDuplicatesAcrossInstancesExecuteExactlyOnce` | 4 independent middleware instances (separate pools, like separate servers) × 50 duplicates → handler runs **once** in total |
+| `TestPostgresServerErrorRollsBackSideEffect` | handler writes a charge then returns 500 → the charge and the key are both rolled back; the retry charges once |
+| `TestPostgresPanicRollsBackAndWakesFollowers` | leader panics mid-charge → rollback, waiting duplicates get 502, the retry charges once |
+| `TestPostgresClientDisconnectStillCommits` | the client disconnects mid-request → the charge still commits; the retry replays it |
+| `TestPostgresReplayAcrossInstances` | a key committed by one instance is replayed by another, stored headers included |
+| `TestStoreBeginIsSingleLeaderUnderRace` | 500 goroutines race to claim one key in the in-memory store → exactly **1** leader |
+
+To confirm the tests catch real bugs, they were also run against deliberately
+broken code. Skipping the replay produced 4 charges across 4 instances. Writing
+the charge outside the transaction left a charge behind after the crash. Both
+were caught.
 
 ```bash
-make race     # go test -race -count=1 ./...
-make cover    # coverage across ./internal/...
+createdb idempotentpay_test
+make race     # go test -race -count=1 ./...  (TEST_DATABASE_URL defaults to the local idempotentpay_test database)
+make cover
 ```
 
-All tests run clean under `-race`.
+Database tests are skipped when `TEST_DATABASE_URL` is unset. CI runs them
+against a PostgreSQL 16 service container.
